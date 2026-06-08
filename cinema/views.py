@@ -63,20 +63,16 @@ class CinemaHallViewSet(
 
 
 @extend_schema(tags=["movies"])
-class MovieViewSet(
-    mixins.ListModelMixin,
-    mixins.CreateModelMixin,
-    mixins.RetrieveModelMixin,
-    viewsets.GenericViewSet,
-):
-    queryset = Movie.objects.prefetch_related("genres", "actors")
+class MovieViewSet(viewsets.ModelViewSet):
+    queryset = Movie.objects.prefetch_related("genres", "actors").order_by(
+        "id"
+    )
     serializer_class = MovieSerializer
     authentication_classes = (TokenAuthentication,)
     permission_classes = (IsAdminOrIfAuthenticatedReadOnly,)
 
     @staticmethod
     def _params_to_ints(qs):
-        """Converts a list of string IDs to a list of integers"""
         return [int(str_id) for str_id in qs.split(",")]
 
     def get_queryset(self):
