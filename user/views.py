@@ -3,8 +3,13 @@ from rest_framework.authentication import TokenAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.settings import api_settings
+from rest_framework_simplejwt.views import TokenObtainPairView
 
-from user.serializers import UserSerializer, AuthTokenSerializer
+from user.serializers import (
+    UserSerializer,
+    AuthTokenSerializer,
+    EmailTokenObtainPairSerializer,
+)
 
 
 class CreateUserView(generics.CreateAPIView):
@@ -23,3 +28,7 @@ class ManageUserView(generics.RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
+
+
+class EmailTokenObtainPairView(TokenObtainPairView):
+    serializer_class = EmailTokenObtainPairSerializer
