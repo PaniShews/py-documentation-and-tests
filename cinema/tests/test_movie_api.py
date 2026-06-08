@@ -4,7 +4,7 @@ import os
 from PIL import Image
 from django.contrib.auth import get_user_model
 from django.test import TestCase
-from django.urls import reverse
+from django.urls import reverse, reverse_lazy
 
 from rest_framework.test import APIClient
 from rest_framework import status
@@ -12,7 +12,7 @@ from rest_framework import status
 from cinema.models import Movie, MovieSession, CinemaHall, Genre, Actor
 from cinema.serializers import MovieListSerializer, MovieDetailSerializer
 
-MOVIE_URL = reverse("cinema:movie-list")
+MOVIE_URL = reverse_lazy("cinema:movie-list")
 
 
 def sample_movie(**params):
@@ -86,9 +86,7 @@ class AuthenticatedMovieApiTests(TestCase):
 
         res = self.client.get(MOVIE_URL)
 
-        movies = Movie.objects.prefetch_related("genres", "actors").order_by(
-            "id"
-        )
+        movies = Movie.objects.prefetch_related("genres", "actors").order_by("id")
         serializer = MovieListSerializer(movies, many=True)
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
@@ -114,9 +112,7 @@ class AuthenticatedMovieApiTests(TestCase):
         movie_with_genre.genres.add(genre1)
         movie_no_genre = sample_movie(title="No Genre Movie")
 
-        res = self.client.get(
-            MOVIE_URL, {"genres": f"{genre1.id},{genre2.id}"}
-        )
+        res = self.client.get(MOVIE_URL, {"genres": f"{genre1.id},{genre2.id}"})
 
         serializer_with = MovieListSerializer(movie_with_genre)
         serializer_without = MovieListSerializer(movie_no_genre)
@@ -182,12 +178,14 @@ class AdminMovieApiTests(TestCase):
             "title": "New Movie",
             "description": "Great film",
             "duration": 120,
+            "genres": [],
+            "actors": [],
         }
         res = self.client.post(MOVIE_URL, payload)
 
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         movie = Movie.objects.get(id=res.data["id"])
-        for key in payload:
+        for key in ("title", "description", "duration"):
             self.assertEqual(payload[key], getattr(movie, key))
 
     def test_create_movie_with_genres_and_actors(self):

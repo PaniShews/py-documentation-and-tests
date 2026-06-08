@@ -1,327 +1,277 @@
-import tempfile
-import os
+from datetime import datetime
 
-from PIL import Image
-from django.contrib.auth import get_user_model
-from django.test import TestCase
-from django.urls import reverse
+from django.db.models import F, Count
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+from rest_framework import viewsets, mixins, status
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.response import Response
+from rest_framework.viewsets import GenericViewSet
 
-from rest_framework.test import APIClient
-from rest_framework import status
-
-from cinema.models import Movie, MovieSession, CinemaHall, Genre, Actor
-from cinema.serializers import MovieListSerializer, MovieDetailSerializer
-
-MOVIE_URL = reverse("cinema:movie-list")
-
-
-def sample_movie(**params):
-    defaults = {
-        "title": "Sample movie",
-        "description": "Sample description",
-        "duration": 90,
-    }
-    defaults.update(params)
-    return Movie.objects.create(**defaults)
-
-
-def sample_genre(**params):
-    defaults = {"name": "Drama"}
-    defaults.update(params)
-    return Genre.objects.create(**defaults)
+from cinema.models import Genre, Actor, CinemaHall, Movie, MovieSession, Order
+from cinema.permissions import IsAdminOrIfAuthenticatedReadOnly
+from cinema.serializers import (
+    GenreSerializer,
+    ActorSerializer,
+    CinemaHallSerializer,
+    MovieSerializer,
+    MovieSessionSerializer,
+    MovieSessionListSerializer,
+    MovieDetailSerializer,
+    MovieSessionDetailSerializer,
+    MovieListSerializer,
+    OrderSerializer,
+    OrderListSerializer,
+    MovieImageSerializer,
+)
 
 
-def sample_actor(**params):
-    defaults = {"first_name": "George", "last_name": "Clooney"}
-    defaults.update(params)
-    return Actor.objects.create(**defaults)
+class GenreViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    GenericViewSet,
+):
+    queryset = Genre.objects.all()
+    serializer_class = GenreSerializer
+    authentication_classes = (TokenAuthentication,)
+    permission_classes = (IsAdminOrIfAuthenticatedReadOnly,)
 
 
-def sample_movie_session(**params):
-    cinema_hall = CinemaHall.objects.create(
-        name="Blue", rows=20, seats_in_row=20
+class ActorViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    GenericViewSet,
+):
+    queryset = Actor.objects.all()
+    serializer_class = ActorSerializer
+    authentication_classes = (TokenAuthentication,)
+    permission_classes = (IsAdminOrIfAuthenticatedReadOnly,)
+
+
+class CinemaHallViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    GenericViewSet,
+):
+    queryset = CinemaHall.objects.all()
+    serializer_class = CinemaHallSerializer
+    authentication_classes = (TokenAuthentication,)
+    permission_classes = (IsAdminOrIfAuthenticatedReadOnly,)
+
+
+@extend_schema(tags=["movies"])
+class MovieViewSet(viewsets.ModelViewSet):
+    queryset = Movie.objects.prefetch_related(
+        "genres",
+        "actors"
+    ).order_by("id")
+    serializer_class = MovieSerializer
+    authentication_classes = (TokenAuthentication,)
+    permission_classes = (IsAdminOrIfAuthenticatedReadOnly,)
+
+    @staticmethod
+    def _params_to_ints(qs):
+        """Converts a list of string IDs to a list of integers"""
+        return [int(str_id) for str_id in qs.split(",")]
+
+    def get_queryset(self):
+        """Retrieve the movies with filters"""
+        title = self.request.query_params.get("title")
+        genres = self.request.query_params.get("genres")
+        actors = self.request.query_params.get("actors")
+
+        queryset = self.queryset
+
+        if title:
+            queryset = queryset.filter(title__icontains=title)
+
+        if genres:
+            genres_ids = self._params_to_ints(genres)
+            queryset = queryset.filter(genres__id__in=genres_ids)
+
+        if actors:
+            actors_ids = self._params_to_ints(actors)
+            queryset = queryset.filter(actors__id__in=actors_ids)
+
+        return queryset.distinct()
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return MovieListSerializer
+
+        if self.action == "retrieve":
+            return MovieDetailSerializer
+
+        if self.action == "upload_image":
+            return MovieImageSerializer
+
+        return MovieSerializer
+
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update", "destroy"):
+            return [IsAdminUser()]
+        return [IsAuthenticated()]
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="title",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Filter movies by title (case-insensitive, partial match)."
+                    "Example: ?title=inception"
+                ),
+            ),
+            OpenApiParameter(
+                name="genres",
+                type={"type": "array", "items": {"type": "integer"}},
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Filter movies by one or more genre IDs, "
+                    "provided as comma-separated integers. "
+                    "Example: ?genres=1,2,3"
+                ),
+            ),
+            OpenApiParameter(
+                name="actors",
+                type={"type": "array", "items": {"type": "integer"}},
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Filter movies by one or more actor IDs, "
+                    "provided as comma-separated integers. "
+                    "Example: ?actors=4,7"
+                ),
+            ),
+        ]
     )
-    defaults = {
-        "show_time": "2022-06-02 14:00:00",
-        "movie": None,
-        "cinema_hall": cinema_hall,
-    }
-    defaults.update(params)
-    return MovieSession.objects.create(**defaults)
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @action(
+        methods=["POST"],
+        detail=True,
+        url_path="upload-image",
+        permission_classes=[IsAdminUser],
+    )
+    @extend_schema(
+        request=MovieImageSerializer,
+        responses=MovieImageSerializer,
+        description="Upload a poster image for the specified movie.",
+    )
+    def upload_image(self, request, pk=None):
+        """Endpoint for uploading image to specific movie"""
+        movie = self.get_object()
+        serializer = self.get_serializer(movie, data=request.data)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-def image_upload_url(movie_id):
-    return reverse("cinema:movie-upload-image", args=[movie_id])
-
-
-def detail_url(movie_id):
-    return reverse("cinema:movie-detail", args=[movie_id])
-
-
-class UnauthenticatedMovieApiTests(TestCase):
-    """Анонімний користувач не повинен мати доступ до жодного ендпоінту"""
-
-    def setUp(self):
-        self.client = APIClient()
-
-    def test_auth_required_for_list(self):
-        res = self.client.get(MOVIE_URL)
-        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
-
-    def test_auth_required_for_detail(self):
-        movie = sample_movie()
-        res = self.client.get(detail_url(movie.id))
-        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
-
-
-class AuthenticatedMovieApiTests(TestCase):
-    """Авторизований звичайний користувач може лише читати"""
-
-    def setUp(self):
-        self.client = APIClient()
-        self.user = get_user_model().objects.create_user(
-            "user@cinema.com", "password123"
-        )
-        self.client.force_authenticate(self.user)
-
-    # --- list ---
-
-    def test_list_movies(self):
-        sample_movie()
-        sample_movie(title="Another movie")
-
-        res = self.client.get(MOVIE_URL)
-
-        movies = Movie.objects.prefetch_related(
-            "genres",
-            "actors"
-        ).order_by("id")
-        serializer = MovieListSerializer(movies, many=True)
-
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data, serializer.data)
-
-    def test_filter_movies_by_title(self):
-        movie1 = sample_movie(title="Inception")
-        movie2 = sample_movie(title="Interstellar")
-        sample_movie(title="Unrelated")
-
-        res = self.client.get(MOVIE_URL, {"title": "inter"})
-
-        serializer1 = MovieListSerializer(movie1)
-        serializer2 = MovieListSerializer(movie2)
-
-        self.assertNotIn(serializer1.data, res.data)
-        self.assertIn(serializer2.data, res.data)
-
-    def test_filter_movies_by_genres(self):
-        genre1 = sample_genre(name="Action")
-        genre2 = sample_genre(name="Comedy")
-        movie_with_genre = sample_movie(title="Action Movie")
-        movie_with_genre.genres.add(genre1)
-        movie_no_genre = sample_movie(title="No Genre Movie")
-
-        res = self.client.get(
-            MOVIE_URL,
-            {"genres": f"{genre1.id},{genre2.id}"}
-        )
-
-        serializer_with = MovieListSerializer(movie_with_genre)
-        serializer_without = MovieListSerializer(movie_no_genre)
-
-        self.assertIn(serializer_with.data, res.data)
-        self.assertNotIn(serializer_without.data, res.data)
-
-    def test_filter_movies_by_actors(self):
-        actor = sample_actor()
-        movie_with_actor = sample_movie(title="With Actor")
-        movie_with_actor.actors.add(actor)
-        movie_without_actor = sample_movie(title="Without Actor")
-
-        res = self.client.get(MOVIE_URL, {"actors": str(actor.id)})
-
-        serializer_with = MovieListSerializer(movie_with_actor)
-        serializer_without = MovieListSerializer(movie_without_actor)
-
-        self.assertIn(serializer_with.data, res.data)
-        self.assertNotIn(serializer_without.data, res.data)
-
-    # --- retrieve ---
-
-    def test_retrieve_movie_detail(self):
-        movie = sample_movie()
-        movie.genres.add(sample_genre())
-        movie.actors.add(sample_actor())
-
-        res = self.client.get(detail_url(movie.id))
-        serializer = MovieDetailSerializer(movie)
-
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data, serializer.data)
-
-    # --- write operations forbidden ---
-
-    def test_create_movie_forbidden(self):
-        payload = {
-            "title": "New Movie",
-            "description": "Desc",
-            "duration": 120,
-        }
-        res = self.client.post(MOVIE_URL, payload)
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_update_movie_forbidden(self):
-        movie = sample_movie()
-        res = self.client.patch(detail_url(movie.id), {"title": "Updated"})
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_delete_movie_forbidden(self):
-        movie = sample_movie()
-        res = self.client.delete(detail_url(movie.id))
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-
-class AdminMovieApiTests(TestCase):
-    """Адміністратор має повний доступ: читання + запис"""
-
-    def setUp(self):
-        self.client = APIClient()
-        self.user = get_user_model().objects.create_superuser(
-            "admin@cinema.com", "password123"
-        )
-        self.client.force_authenticate(self.user)
-
-    def test_create_movie(self):
-        payload = {
-            "title": "New Movie",
-            "description": "Great film",
-            "duration": 120,
-            "genres": [],
-            "actors": [],
-        }
-        res = self.client.post(MOVIE_URL, payload)
-
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        movie = Movie.objects.get(id=res.data["id"])
-        for key in ("title", "description", "duration"):
-            self.assertEqual(payload[key], getattr(movie, key))
-
-    def test_create_movie_with_genres_and_actors(self):
-        genre = sample_genre()
-        actor = sample_actor()
-        payload = {
-            "title": "Movie With Relations",
-            "description": "Desc",
-            "duration": 100,
-            "genres": [genre.id],
-            "actors": [actor.id],
-        }
-        res = self.client.post(MOVIE_URL, payload)
-
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        movie = Movie.objects.get(id=res.data["id"])
-        self.assertIn(genre, movie.genres.all())
-        self.assertIn(actor, movie.actors.all())
-
-    def test_update_movie(self):
-        movie = sample_movie()
-        payload = {"title": "Updated Title", "duration": 200}
-        res = self.client.patch(detail_url(movie.id), payload)
-
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        movie.refresh_from_db()
-        self.assertEqual(movie.title, payload["title"])
-        self.assertEqual(movie.duration, payload["duration"])
-
-    def test_delete_movie(self):
-        movie = sample_movie()
-        res = self.client.delete(detail_url(movie.id))
-
-        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Movie.objects.filter(id=movie.id).exists())
-
-
-class MovieImageUploadTests(TestCase):
-    def setUp(self):
-        self.client = APIClient()
-        self.user = get_user_model().objects.create_superuser(
-            "admin@myproject.com", "password"
-        )
-        self.client.force_authenticate(self.user)
-        self.movie = sample_movie()
-        self.genre = sample_genre()
-        self.actor = sample_actor()
-        self.movie_session = sample_movie_session(movie=self.movie)
-
-    def tearDown(self):
-        self.movie.image.delete()
-
-    def test_upload_image_to_movie(self):
-        url = image_upload_url(self.movie.id)
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as ntf:
-            img = Image.new("RGB", (10, 10))
-            img.save(ntf, format="JPEG")
-            ntf.seek(0)
-            res = self.client.post(url, {"image": ntf}, format="multipart")
-        self.movie.refresh_from_db()
-
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertIn("image", res.data)
-        self.assertTrue(os.path.exists(self.movie.image.path))
-
-    def test_upload_image_bad_request(self):
-        url = image_upload_url(self.movie.id)
-        res = self.client.post(url, {"image": "not image"}, format="multipart")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_post_image_to_movie_list(self):
-        url = MOVIE_URL
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as ntf:
-            img = Image.new("RGB", (10, 10))
-            img.save(ntf, format="JPEG")
-            ntf.seek(0)
-            res = self.client.post(
-                url,
-                {
-                    "title": "Title",
-                    "description": "Description",
-                    "duration": 90,
-                    "genres": [1],
-                    "actors": [1],
-                    "image": ntf,
-                },
-                format="multipart",
+@extend_schema(tags=["movie sessions"])
+class MovieSessionViewSet(viewsets.ModelViewSet):
+    queryset = (
+        MovieSession.objects.all()
+        .select_related("movie", "cinema_hall")
+        .annotate(
+            tickets_available=(
+                F("cinema_hall__rows") * F("cinema_hall__seats_in_row")
+                - Count("tickets")
             )
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        movie = Movie.objects.get(title="Title")
-        self.assertFalse(movie.image)
+        )
+    )
+    serializer_class = MovieSessionSerializer
+    authentication_classes = (TokenAuthentication,)
+    permission_classes = (IsAdminOrIfAuthenticatedReadOnly,)
 
-    def test_image_url_is_shown_on_movie_detail(self):
-        url = image_upload_url(self.movie.id)
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as ntf:
-            img = Image.new("RGB", (10, 10))
-            img.save(ntf, format="JPEG")
-            ntf.seek(0)
-            self.client.post(url, {"image": ntf}, format="multipart")
-        res = self.client.get(detail_url(self.movie.id))
-        self.assertIn("image", res.data)
+    def get_queryset(self):
+        date = self.request.query_params.get("date")
+        movie_id_str = self.request.query_params.get("movie")
 
-    def test_image_url_is_shown_on_movie_list(self):
-        url = image_upload_url(self.movie.id)
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as ntf:
-            img = Image.new("RGB", (10, 10))
-            img.save(ntf, format="JPEG")
-            ntf.seek(0)
-            self.client.post(url, {"image": ntf}, format="multipart")
-        res = self.client.get(MOVIE_URL)
-        self.assertIn("image", res.data[0].keys())
+        queryset = self.queryset
 
-    def test_image_url_is_shown_on_movie_session_detail(self):
-        url = image_upload_url(self.movie.id)
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as ntf:
-            img = Image.new("RGB", (10, 10))
-            img.save(ntf, format="JPEG")
-            ntf.seek(0)
-            self.client.post(url, {"image": ntf}, format="multipart")
-        res = self.client.get(reverse("cinema:moviesession-list"))
-        self.assertIn("movie_image", res.data[0].keys())
+        if date:
+            date = datetime.strptime(date, "%Y-%m-%d").date()
+            queryset = queryset.filter(show_time__date=date)
+
+        if movie_id_str:
+            queryset = queryset.filter(movie_id=int(movie_id_str))
+
+        return queryset
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return MovieSessionListSerializer
+
+        if self.action == "retrieve":
+            return MovieSessionDetailSerializer
+
+        return MovieSessionSerializer
+
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update", "destroy"):
+            return [IsAdminUser()]
+        return [IsAuthenticated()]
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Filter movie sessions by show date (YYYY-MM-DD format). "
+                    "Example: ?date=2024-06-15"
+                ),
+            ),
+            OpenApiParameter(
+                name="movie",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Filter movie sessions by movie ID. "
+                    "Example: ?movie=3"
+                ),
+            ),
+        ]
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+
+class OrderPagination(PageNumberPagination):
+    page_size = 10
+    max_page_size = 100
+
+
+@extend_schema(tags=["orders"])
+class OrderViewSet(
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    GenericViewSet,
+):
+    queryset = Order.objects.prefetch_related(
+        "tickets__movie_session__movie", "tickets__movie_session__cinema_hall"
+    )
+    serializer_class = OrderSerializer
+    pagination_class = OrderPagination
+    authentication_classes = (TokenAuthentication,)
+    permission_classes = (IsAuthenticated,)
+
+    def get_queryset(self):
+        return Order.objects.filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return OrderListSerializer
+
+        return OrderSerializer
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
